@@ -13,9 +13,10 @@ constexpr std::uint8_t PWR_MGMT_2 = 0x07;
 constexpr std::uint8_t ACCEL_XOUT_H = 0x2D;
 constexpr std::uint8_t REG_BANK_SEL = 0x7F;
 
+
 esp_err_t write_register(spi_device_handle_t spi,
                          std::uint8_t address,
-                         std::uint8_t value)
+                         std::uint8_t value) 
 {
     std::array<std::uint8_t, 2> tx{address, value};
 
@@ -25,6 +26,7 @@ esp_err_t write_register(spi_device_handle_t spi,
 
     return spi_device_transmit(spi, &transaction);
 }
+
 
 esp_err_t read_register(spi_device_handle_t spi,
                         std::uint8_t address,
@@ -47,6 +49,7 @@ esp_err_t read_register(spi_device_handle_t spi,
     return err;
 }
 
+
 std::int16_t signed_word(std::uint8_t high, std::uint8_t low)
 {
     int value = (static_cast<int>(high) << 8) | low;
@@ -56,6 +59,7 @@ std::int16_t signed_word(std::uint8_t high, std::uint8_t low)
     return static_cast<std::int16_t>(value);
 }
 }  // namespace
+
 
 esp_err_t imu_init(spi_device_handle_t spi)
 {
@@ -81,7 +85,8 @@ esp_err_t imu_init(spi_device_handle_t spi)
     return write_register(spi, PWR_MGMT_2, 0x00); // Enable all axes.
 }
 
-esp_err_t imu_read(spi_device_handle_t spi, ImuSample& sample)
+
+esp_err_t imu_read(spi_device_handle_t spi, ImuSample& sample) 
 {
     // One address byte, then 12 consecutive data bytes.
     std::array<std::uint8_t, 13> tx{};
