@@ -16,15 +16,17 @@ struct ImuSample {
 
 class Imu {
 public:
+    // constructor and destructor
     Imu() = default;
-    ~Imu();
+    ~Imu(); // defined in imu.cpp
 
-    Imu(const Imu&) = delete;
+    // Prevent copying and assignment to avoid multiple instances managing the same SPI device.
+    Imu(const Imu&) = delete; // delete simply means forbidden operation
     Imu& operator=(const Imu&) = delete;
 
-    // The SPI bus must be initialized first and outlive this device.
+    // Declare user facing functions
     esp_err_t init(spi_host_device_t host, int cs_pin);
-    esp_err_t read(ImuSample& sample);
+    esp_err_t read_and_write_to_sample(ImuSample& sample);
 
 private:
     spi_device_handle_t spi_ = nullptr;
