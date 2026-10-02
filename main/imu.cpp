@@ -4,6 +4,8 @@
 #include <cstdint>
 
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 namespace {
 constexpr std::uint8_t WHO_AM_I = 0x00;
@@ -58,10 +60,7 @@ std::int16_t signed_word(std::uint8_t high, std::uint8_t low)
     }
     return static_cast<std::int16_t>(value);
 }
-}  // namespace
-
-
-esp_err_t imu_init(spi_device_handle_t spi)
+esp_err_t configure(spi_device_handle_t spi)
 {
     // The identity and measurement registers are in bank 0.
     esp_err_t err = write_register(spi, REG_BANK_SEL, 0x00);
@@ -84,10 +83,49 @@ esp_err_t imu_init(spi_device_handle_t spi)
 
     return write_register(spi, PWR_MGMT_2, 0x00); // Enable all axes.
 }
+}  // namespace
 
-
-esp_err_t imu_read(spi_device_handle_t spi, ImuSample& sample) 
+Imu::~Imu()
 {
+    if (spi_ != nullptr) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(spi_bus_remove_device(spi_));
+    }
+}
+
+esp_err_t Imu::init(spi_host_device_t host, int cs_pin)
+{
+    if (spi_ != nullptr) return ESP_ERR_INVALID_STATE;
+
+    spi_device_interface_config_t device{};
+    device.clock_speed_hz = 1'000'000;
+    device.mode = 0;
+    device.spics_io_num = cs_pin;
+    device.queue_size = 1;
+
+    esp_err_t err = spi_bus_add_device(host, &device, &spi_);
+    if (err != ESP_OK) return err;
+
+    vTaskDelay(pdMS_TO_TICKS(100)); // Allow the IMU to start.
+    err = configure(spi_);
+    if (err != ESP_OK) {
+        esp_err_t cleanup_err = spi_bus_remove_device(spi_);
+        if (cleanup_err == ESP_OK) {
+            spi_ = nullptr;
+        } else {
+            ESP_LOGE("IMU", "Device cleanup failed: %s", esp_err_to_name(cleanup_err));
+        }
+        return err;
+    }
+
+    initialized_ = true;
+    return ESP_OK;
+}
+
+
+esp_err_t Imu::read(ImuSample& sample)
+{
+    if (!initialized_) return ESP_ERR_INVALID_STATE;
+
     // One address byte, then 12 consecutive data bytes.
     std::array<std::uint8_t, 13> tx{};
     std::array<std::uint8_t, 13> rx{};
@@ -98,7 +136,7 @@ esp_err_t imu_read(spi_device_handle_t spi, ImuSample& sample)
     transaction.tx_buffer = tx.data();
     transaction.rx_buffer = rx.data();
 
-    esp_err_t err = spi_device_transmit(spi, &transaction);
+    esp_err_t err = spi_device_transmit(spi_, &transaction);
     if (err != ESP_OK) return err;
 
     sample.accel_x = signed_word(rx[1],  rx[2]);

@@ -14,5 +14,19 @@ struct ImuSample {
     std::int16_t gyro_z;
 };
 
-esp_err_t imu_init(spi_device_handle_t spi);
-esp_err_t imu_read(spi_device_handle_t spi, ImuSample& sample);
+class Imu {
+public:
+    Imu() = default;
+    ~Imu();
+
+    Imu(const Imu&) = delete;
+    Imu& operator=(const Imu&) = delete;
+
+    // The SPI bus must be initialized first and outlive this device.
+    esp_err_t init(spi_host_device_t host, int cs_pin);
+    esp_err_t read(ImuSample& sample);
+
+private:
+    spi_device_handle_t spi_ = nullptr;
+    bool initialized_ = false;
+};
