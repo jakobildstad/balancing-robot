@@ -29,8 +29,8 @@ extern "C" void app_main(void)
 
         if (err == ESP_OK) {
             // Teleplot reads one >name:value measurement per line.
-            std::printf(">accel_x:%d\n>accel_y:%d\n>accel_z:%d\n"
-                        ">gyro_x:%d\n>gyro_y:%d\n>gyro_z:%d\n",
+            std::printf(">accel_x_mps2:%.5f\n>accel_y_mps2:%.5f\n>accel_z_mps2:%.5f\n"
+                        ">gyro_x_rad_s:%.5f\n>gyro_y_rad_s:%.5f\n>gyro_z_rad_s:%.5f\n",
                         sample.accel_x, sample.accel_y, sample.accel_z,
                         sample.gyro_x, sample.gyro_y, sample.gyro_z);
         } else {

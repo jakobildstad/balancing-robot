@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <numbers>
 
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -16,6 +17,13 @@ constexpr std::uint8_t PWR_MGMT_1 = 0x06;
 constexpr std::uint8_t PWR_MGMT_2 = 0x07;
 constexpr std::uint8_t ACCEL_XOUT_H = 0x2D;
 constexpr std::uint8_t REG_BANK_SEL = 0x7F;
+
+// Bank 2 range settings and their matching sensitivities (ICM-20948 datasheet).
+constexpr std::uint8_t GYRO_CONFIG_1 = 0x01;
+constexpr std::uint8_t ACCEL_CONFIG = 0x14;
+constexpr std::uint8_t FULL_SCALE_MASK = 0x06; // Bits 2:1; zero selects +/-250 deg/s and +/-2 g.
+constexpr float ACCEL_MPS2_PER_COUNT = 9.80665f / 16384.0f;
+constexpr float GYRO_RAD_S_PER_COUNT = std::numbers::pi_v<float> / (180.0f * 131.0f);
 
 
 // function to write a value to a register on the IMU over SPI.
@@ -89,7 +97,27 @@ esp_err_t configure(spi_device_handle_t spi)
     err = write_register(spi, PWR_MGMT_1, 0x01); // Wake; select clock.
     if (err != ESP_OK) return err;
 
-    return write_register(spi, PWR_MGMT_2, 0x00); // Enable all axes.
+    err = write_register(spi, PWR_MGMT_2, 0x00); // Enable all axes.
+    if (err != ESP_OK) return err;
+
+    err = write_register(spi, REG_BANK_SEL, 0x20); // Select bank 2.
+    if (err != ESP_OK) return err;
+
+    // Set the ranges explicitly so the conversions match; preserve filter settings.
+    std::uint8_t config = 0;
+    err = read_register(spi, GYRO_CONFIG_1, config);
+    if (err != ESP_OK) return err;
+    err = write_register(spi, GYRO_CONFIG_1,
+                         static_cast<std::uint8_t>(config & ~FULL_SCALE_MASK));
+    if (err != ESP_OK) return err;
+
+    err = read_register(spi, ACCEL_CONFIG, config);
+    if (err != ESP_OK) return err;
+    err = write_register(spi, ACCEL_CONFIG,
+                         static_cast<std::uint8_t>(config & ~FULL_SCALE_MASK));
+    if (err != ESP_OK) return err;
+
+    return write_register(spi, REG_BANK_SEL, 0x00); // Restore bank 0 for measurements.
 }
 }  // namespace
 
@@ -101,11 +129,11 @@ Imu::~Imu()
     }
 }
 
-esp_err_t init(
+esp_err_t Imu::init(
     spi_host_device_t host,
     int cs_pin,
-    int clock_speed_hz = 1'000'000
-);
+    int clock_speed_hz
+)
 {
     if (spi_ != nullptr) return ESP_ERR_INVALID_STATE;
 
@@ -155,12 +183,12 @@ esp_err_t Imu::read_and_write_to_sample(ImuSample& sample)
     esp_err_t err = spi_device_transmit(spi_, &transaction);
     if (err != ESP_OK) return err;
 
-    sample.accel_x = signed_word(rx[1],  rx[2]);
-    sample.accel_y = signed_word(rx[3],  rx[4]);
-    sample.accel_z = signed_word(rx[5],  rx[6]);
-    sample.gyro_x  = signed_word(rx[7],  rx[8]);
-    sample.gyro_y  = signed_word(rx[9],  rx[10]);
-    sample.gyro_z  = signed_word(rx[11], rx[12]);
+    sample.accel_x = signed_word(rx[1],  rx[2]) * ACCEL_MPS2_PER_COUNT;
+    sample.accel_y = signed_word(rx[3],  rx[4]) * ACCEL_MPS2_PER_COUNT;
+    sample.accel_z = signed_word(rx[5],  rx[6]) * ACCEL_MPS2_PER_COUNT;
+    sample.gyro_x  = signed_word(rx[7],  rx[8]) * GYRO_RAD_S_PER_COUNT;
+    sample.gyro_y  = signed_word(rx[9],  rx[10]) * GYRO_RAD_S_PER_COUNT;
+    sample.gyro_z  = signed_word(rx[11], rx[12]) * GYRO_RAD_S_PER_COUNT;
 
     return ESP_OK;
 }

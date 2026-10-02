@@ -6,12 +6,14 @@
 #include "esp_err.h"
 
 struct ImuSample {
-    std::int16_t accel_x;
-    std::int16_t accel_y;
-    std::int16_t accel_z;
-    std::int16_t gyro_x;
-    std::int16_t gyro_y;
-    std::int16_t gyro_z;
+    // Sensor-frame acceleration in m/s^2, including the response to gravity.
+    float accel_x;
+    float accel_y;
+    float accel_z;
+    // Sensor-frame angular velocity in rad/s; gyro bias is not removed yet.
+    float gyro_x;
+    float gyro_y;
+    float gyro_z;
 };
 
 class Imu {
@@ -25,7 +27,7 @@ public:
     Imu& operator=(const Imu&) = delete;
 
     // Declare user facing functions
-    esp_err_t init(spi_host_device_t host, int cs_pin);
+    esp_err_t init(spi_host_device_t host, int cs_pin, int clock_speed_hz = 1'000'000);
     esp_err_t read_and_write_to_sample(ImuSample& sample);
 
 private:
