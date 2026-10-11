@@ -70,6 +70,28 @@ static_assert(valid_motor_pins(), "Motor GPIOs must be valid, distinct and unuse
 bool initialized = false;
 motors::Config settings{};
 
+bool valid_mapping(const motors::CommandMapping& mapping)
+{
+    return std::isfinite(mapping.deadband) && std::isfinite(mapping.min_duty) &&
+           std::isfinite(mapping.max_duty) &&
+           mapping.deadband >= 0.0f && mapping.deadband < 1.0f &&
+           mapping.min_duty >= 0.0f && mapping.min_duty <= mapping.max_duty &&
+           mapping.max_duty <= 1.0f;
+}
+
+float map_command(float command, const motors::CommandMapping& mapping)
+{
+    const float magnitude = std::min(std::abs(command), 1.0f);
+    if (magnitude <= mapping.deadband) {
+        return 0.0f;
+    }
+    // Rescale the active command range to [min_duty, max_duty]. A nonzero
+    // min_duty introduces a jump; it is optional compensation, not measured torque.
+    const float fraction = (magnitude - mapping.deadband) / (1.0f - mapping.deadband);
+    const float duty = mapping.min_duty + fraction * (mapping.max_duty - mapping.min_duty);
+    return std::copysign(duty, command);
+}
+
 esp_err_t disable_motor(Motor& motor)
 {
     // ledc_stop forces EN low without waiting for a new duty value to take effect.
@@ -158,7 +180,8 @@ esp_err_t motors::init(const Config& config)
         return stop_on_error(ESP_ERR_INVALID_STATE);
     }
     if (config.pwm_frequency_hz == 0 || !std::isfinite(config.duty_limit) ||
-        config.duty_limit <= 0.0f || config.duty_limit > 1.0f) {
+        config.duty_limit <= 0.0f || config.duty_limit > 1.0f ||
+        !valid_mapping(config.left_mapping) || !valid_mapping(config.right_mapping)) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -224,4 +247,16 @@ esp_err_t motors::set_duty(float left, float right)
 esp_err_t motors::stop()
 {
     return initialized ? disable_both() : ESP_ERR_INVALID_STATE;
+}
+
+esp_err_t motors::set_command(float left, float right)
+{
+    if (!initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!std::isfinite(left) || !std::isfinite(right)) {
+        return stop_on_error(ESP_ERR_INVALID_ARG);
+    }
+    return set_duty(map_command(left, settings.left_mapping),
+                    map_command(right, settings.right_mapping));
 }

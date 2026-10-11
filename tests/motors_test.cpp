@@ -152,6 +152,8 @@ int main(int argc, char** argv)
         check(timer_calls == 0, "Invalid configuration must not configure PWM");
         check(motors::set_duty(0.2f, 0.2f) == ESP_ERR_INVALID_STATE,
               "Commands before initialization must be rejected");
+        check(motors::set_command(0.2f, 0.2f) == ESP_ERR_INVALID_STATE,
+              "Mapped commands before initialization must be rejected");
         check(motors::stop() == ESP_ERR_INVALID_STATE, "Stop before init must fail");
         check(motors::init() == ESP_OK, "Valid configuration must still work");
         expect_disabled();
@@ -213,13 +215,60 @@ int main(int argc, char** argv)
         check(motors::set_duty(1.0f, -1.0f) == ESP_OK, "Full duty must succeed");
         check(outputs[0].duty == 1024 && outputs[1].duty == 1024,
               "Full duty must map to 1024 ticks");
-    } else if (scenario == "invalid_command") {
+    } else if (scenario == "mapping_identity") {
+        check(motors::init({5000, 1.0f}) == ESP_OK, "Init must succeed");
+        check(motors::set_command(0.25f, -0.5f) == ESP_OK, "Mapped command must work");
+        check(outputs[0].duty == 256 && outputs[1].duty == 512,
+              "Default mapping must preserve duty");
+        check(gpio_levels[board::RIGHT_MOTOR_IN1_PIN] == board::RIGHT_MOTOR_INVERTED,
+              "Mapping must preserve negative direction");
+        check(motors::set_command(2.0f, -2.0f) == ESP_OK, "Clamping must work");
+        check(outputs[0].duty == 1024 && outputs[1].duty == 1024,
+              "Commands beyond one must saturate");
+        check(motors::set_command(0.0f, -0.0f) == ESP_OK, "Zero must work");
+        expect_disabled();
+    } else if (scenario == "mapping_calibrated" || scenario == "mapping_limit") {
+        const float limit = scenario == "mapping_limit" ? 0.5f : 1.0f;
+        check(motors::init({5000, limit, {0.2f, 0.4f, 0.8f}, {0.1f, 0.2f, 0.6f}}) == ESP_OK,
+              "Per-motor mapping must be configurable");
+        check(motors::set_command(0.6f, -0.55f) == ESP_OK, "Mapping must work");
+        check(outputs[0].duty == (limit == 0.5f ? 512U : 614U) && outputs[1].duty == 410,
+              "Each motor must use its own mapping, subject to the global duty cap");
+        check(motors::set_command(0.2f, -0.1f) == ESP_OK, "Deadband boundary must work");
+        expect_disabled();
+        check(motors::set_command(0.0f, 0.0f) == ESP_OK, "Zero must bypass minimum duty");
+        expect_disabled();
+        check(motors::set_command(0.2001f, -0.1001f) == ESP_OK, "Above deadband must work");
+        check(outputs[0].duty == 410 && outputs[1].duty == 205,
+              "Commands just outside the deadband must start near minimum duty");
+        check(motors::set_command(-1.0f, 1.0f) == ESP_OK, "Endpoints must work");
+        check(outputs[0].duty == (limit == 0.5f ? 512U : 819U) &&
+              outputs[1].duty == (limit == 0.5f ? 512U : 614U),
+              "Full commands must reach configured maximum duty within the global cap");
+        check(motors::set_duty(0.1f, -0.1f) == ESP_OK, "Direct duty must work");
+        check(outputs[0].duty == 102 && outputs[1].duty == 102,
+              "Direct duty must bypass calibration");
+    } else if (scenario == "invalid_mapping") {
+        for (const motors::CommandMapping mapping : {
+                 motors::CommandMapping{nan, 0, 1}, {infinity, 0, 1}, {-0.1f, 0, 1},
+                 {1, 0, 1}, {0, nan, 1}, {0, infinity, 1}, {0, -0.1f, 1},
+                 {0, 0.8f, 0.7f}, {0, 0, nan}, {0, 0, infinity}, {0, 0, 1.1f}}) {
+            for (bool left : {false, true}) {
+                motors::Config config{};
+                (left ? config.left_mapping : config.right_mapping) = mapping;
+                check(motors::init(config) == ESP_ERR_INVALID_ARG, "Invalid mapping accepted");
+            }
+        }
+        check(timer_calls == 0, "Invalid mapping must not configure hardware");
+        check(motors::init() == ESP_OK, "Valid init must still work");
+    } else if (scenario == "invalid_command" || scenario == "invalid_mapped_command") {
         start_motors();
+        const auto send = scenario == "invalid_command" ? motors::set_duty : motors::set_command;
         for (float invalid : {nan, infinity, -infinity}) {
             for (bool invalid_left : {false, true}) {
                 check(motors::set_duty(0.2f, 0.2f) == ESP_OK, "Restart must succeed");
-                check(motors::set_duty(invalid_left ? invalid : 0.2f,
-                                      invalid_left ? 0.2f : invalid) == ESP_ERR_INVALID_ARG,
+                check(send(invalid_left ? invalid : 0.2f,
+                           invalid_left ? 0.2f : invalid) == ESP_ERR_INVALID_ARG,
                       "Non-finite command must fail");
                 expect_disabled();
             }
