@@ -1,19 +1,16 @@
 #include "board.hpp"
+#include "console.hpp"
 #include "control.hpp"
 #include "imu.hpp"
 #include "motors.hpp"
 #include "tilt_estimator.hpp"
+#include "wireless.hpp"
 
-#include <cerrno>
 #include <cstdint>
 #include <cstdio>
-#include <string_view>
-#include <fcntl.h>
-#include <unistd.h>
 
 #include "esp_check.h"
 #include "esp_log.h"
-#include "esp_stdio.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -43,85 +40,14 @@ constexpr ControlConfig CONTROL_CONFIG{
 };
 constexpr float MAX_CONTROL_INTERVAL_S = 0.05f;
 
-enum class Command { none, ping, test_left, test_right, balance, stop, console_error };
 enum class MotorMode { idle, test_left, test_right, balance };
-
-Command read_command()
-{
-    static char command[16]{};
-    static std::size_t length = 0;
-    static bool overflow = false;
-
-    // Bound console work so input cannot starve the sensor/control loop.
-    for (unsigned count = 0; count < sizeof(command); ++count) {
-        char c;
-        const ssize_t received = read(STDIN_FILENO, &c, 1);
-        if (received <= 0) {
-            if (received < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
-                errno != EINTR && errno != EIO) {
-                ESP_LOGE("Motor", "Console read failed: errno=%d", errno);
-                return Command::console_error;
-            }
-            if (received < 0 && errno == EIO) {
-                // Discard partial commands across USB disconnects.
-                length = 0;
-                overflow = false;
-                return Command::stop;
-            }
-            return Command::none;
-        }
-        if (c != '\r' && c != '\n') {
-            if (length < sizeof(command) - 1) {
-                command[length++] = c;
-            } else {
-                overflow = true;
-            }
-            continue;
-        }
-
-        const std::string_view input{command, length};
-        const bool too_long = overflow;
-        length = 0;
-        overflow = false;
-        if (input.empty() && !too_long) {
-            continue;
-        }
-        if (!too_long) {
-            if (input == "ping") return Command::ping;
-            if (input == "test" || input == "test left") return Command::test_left;
-            if (input == "test right") return Command::test_right;
-            if (input == "balance") return Command::balance;
-            if (input == "stop") return Command::stop;
-        }
-        ESP_LOGW("Motor", "Use 'ping', 'test left', 'test right', 'balance' or 'stop'");
-        return Command::none;
-    }
-    return Command::none;
-}
-
-bool init_console()
-{
-    // ESP-IDF 6.1 nonblocking stdin reads need the USB driver's RX buffer.
-    const esp_err_t err = esp_stdio_install_io_driver();
-    if (err != ESP_OK) {
-        ESP_LOGE("Motor", "Cannot initialize console: %s; motors remain disabled",
-                 esp_err_to_name(err));
-        return false;
-    }
-    const int flags = fcntl(STDIN_FILENO, F_GETFL);
-    if (flags < 0 || fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK) < 0) {
-        ESP_LOGE("Motor", "Cannot configure console; motors remain disabled");
-        return false;
-    }
-    ESP_LOGI("Motor", "Commands: ping, test left, test right, balance, stop (then Enter)");
-    ESP_LOGI("Motor", "Tests: 300 ms at 100%%; 'test' aliases 'test left'. Balancing starts OFF");
-    return true;
-}
 }  // namespace
 
 // Main application entry point for ESP32-C6.
 extern "C" void app_main(void) 
 {
+    using console::Command;
+
     // initialize the SPI bus with the specified configuration and no DMA channel, with error checking.
     ESP_ERROR_CHECK(board::init());
 
@@ -140,8 +66,17 @@ extern "C" void app_main(void)
     );
 
     bool motors_ready = motor_init_err == ESP_OK;
-    bool console_ready = init_console();
+    bool console_ready = console::init();
+    ControlConfig control_config = CONTROL_CONFIG;
+    const esp_err_t wifi_err = wireless::init();
+    if (wifi_err != ESP_OK) {
+        ESP_LOGE("WiFi", "Wireless control unavailable: %s", esp_err_to_name(wifi_err));
+    }
+    // The HTTP task stays below this loop; network handlers never drive motors.
+    vTaskPrioritySet(nullptr, 5);
     MotorMode mode = MotorMode::idle;
+    bool remote_motion = false;
+    const char* status = "Ready; gains start at zero";
     std::int64_t test_deadline_us = 0;
     std::int64_t next_test_time_us = 0;
 
@@ -151,23 +86,55 @@ extern "C" void app_main(void)
 
     while (true) {
         const std::int64_t now_us = esp_timer_get_time();
-        const Command command = console_ready ? read_command() : Command::none;
-        if (command == Command::stop || command == Command::console_error) {
-            mode = MotorMode::idle;
+        Command command = console_ready ? console::read_command() : Command::none;
+        bool command_from_wifi = false;
+        if (command == Command::disconnected || command == Command::console_error) {
             if (command == Command::console_error) console_ready = false;
+            command = !remote_motion && mode != MotorMode::idle ? Command::stop : Command::none;
+        }
+
+        wireless::Request request;
+        if (wireless::read_request(request)) {
+            if (request.type == wireless::RequestType::link_lost) {
+                if (remote_motion) command = Command::stop;
+            } else if (request.type == wireless::RequestType::gains) {
+                if (mode == MotorMode::idle && command == Command::none) {
+                    control_config.kp = request.kp;
+                    control_config.kd = request.kd;
+                    status = "PD gains applied; reset on reboot";
+                } else {
+                    status = "Stop before changing PD gains";
+                }
+            } else if (request.type == wireless::RequestType::command) {
+                // Either transport can stop. Other USB commands take priority.
+                if (request.command == Command::stop || command == Command::none) {
+                    command = request.command;
+                    command_from_wifi = true;
+                }
+            }
+        }
+        if (command == Command::stop) {
+            mode = MotorMode::idle;
+            status = "Stopped";
         } else if (command == Command::ping) {
             ESP_LOGI("Motor", "pong");
         } else if (command != Command::none) {
             if (!motors_ready) {
+                status = "Motor driver unavailable until reboot";
                 ESP_LOGW("Motor", "Motor driver unavailable until reboot");
             } else if (mode != MotorMode::idle || now_us < next_test_time_us) {
+                status = "Stop and wait for the test cooldown first";
                 ESP_LOGW("Motor", "Send 'stop' and wait for any test cooldown first");
             } else if (command == Command::balance) {
                 mode = MotorMode::balance;
+                remote_motion = command_from_wifi;
+                status = "Balancing enabled";
                 ESP_LOGI("Control", "Balancing enabled; kp=%.3f kd=%.3f",
-                         CONTROL_CONFIG.kp, CONTROL_CONFIG.kd);
+                         control_config.kp, control_config.kd);
             } else {
                 mode = command == Command::test_left ? MotorMode::test_left : MotorMode::test_right;
+                remote_motion = command_from_wifi;
+                status = "Running 300 ms motor test";
                 test_deadline_us = now_us + MOTOR_TEST_DURATION_US;
                 next_test_time_us = test_deadline_us + 1'000'000;
                 ESP_LOGI("Motor", "Testing %s motor", mode == MotorMode::test_left ? "left" : "right");
@@ -207,14 +174,24 @@ extern "C" void app_main(void)
         const bool test_finished =
             (mode == MotorMode::test_left || mode == MotorMode::test_right) &&
             esp_timer_get_time() >= test_deadline_us;
-        if (test_finished) mode = MotorMode::idle;
+        if (test_finished) {
+            mode = MotorMode::idle;
+            status = "Motor test finished";
+        }
+        if (remote_motion && !wireless::connected()) {
+            mode = MotorMode::idle;
+            status = "Wi-Fi heartbeat lost; motors stopped";
+        }
 
         float u = 0.0f;
         const bool control_rejected = mode == MotorMode::balance &&
             (!sample_valid || dt_s > MAX_CONTROL_INTERVAL_S ||
              !compute_control_command(tilt_estimate.tilt_rad,
-                 sample.gyro_y - TILT_FILTER_CONFIG.gyro_bias_rad_s, u, CONTROL_CONFIG));
-        if (control_rejected) mode = MotorMode::idle;
+                 sample.gyro_y - TILT_FILTER_CONFIG.gyro_bias_rad_s, u, control_config));
+        if (control_rejected) {
+            mode = MotorMode::idle;
+            status = "Stopped: invalid sample, timing, gains or tilt limit";
+        }
 
         // This loop is the sole motor owner. Manual tests bypass f(u).
         if (motors_ready) {
@@ -228,6 +205,7 @@ extern "C" void app_main(void)
                 (void)motors::stop();
                 mode = MotorMode::idle;
                 motors_ready = false;
+                status = "Motor error; disabled until reboot";
                 ESP_LOGE("Motor", "Disabled until reboot: %s", esp_err_to_name(err));
             }
         }
@@ -237,6 +215,21 @@ extern "C" void app_main(void)
         if (control_rejected) {
             ESP_LOGW("Control", "Balancing disabled: invalid sample/timing/config or tilt limit; send 'balance' to rearm");
         }
+
+        if (mode == MotorMode::idle) remote_motion = false;
+        const char* mode_name = mode == MotorMode::balance ? "balance" :
+            mode == MotorMode::test_left ? "test left" :
+            mode == MotorMode::test_right ? "test right" : "idle";
+        wireless::publish({
+            .tilt_rad = tilt_estimate.tilt_rad,
+            .rate_rad_s = sample.gyro_y - TILT_FILTER_CONFIG.gyro_bias_rad_s,
+            .command = mode == MotorMode::balance ? u : 0.0f,
+            .sample_valid = sample_valid,
+            .motors_ready = motors_ready,
+            .mode = mode_name,
+            .status = status,
+            .control = control_config,
+        });
 
         // Nominally 100 Hz with the current 100 Hz RTOS tick; dt above is measured.
         xTaskDelayUntil(&last_wake_time, SAMPLE_PERIOD_TICKS);

@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Balancing robot</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0 auto; padding: 28px 20px; max-width: 700px; background: #f4f5f7; color: #182333; font: 16px system-ui, sans-serif; }
+  h1 { margin: 0 0 8px; font-size: 28px; }
+  h2 { margin: 0 0 16px; font-size: 19px; }
+  p { line-height: 1.5; }
+  .muted { color: #546173; }
+  section { background: white; border: 1px solid #dbe0e7; border-radius: 12px; padding: 20px; margin-top: 18px; }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  .metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin: 0; }
+  dt { color: #546173; font-size: 13px; }
+  dd { margin: 6px 0 0; font-size: 22px; font-variant-numeric: tabular-nums; }
+  button, input { font: inherit; border: 1px solid #b9c3d0; border-radius: 7px; padding: 11px 14px; }
+  button { background: #edf1f6; cursor: pointer; }
+  button:disabled { opacity: .45; cursor: default; }
+  button.primary { background: #225db3; color: white; border-color: #225db3; }
+  #stop { background: #b52e36; color: white; border-color: #b52e36; font-weight: 700; width: 100%; margin-top: 14px; }
+  fieldset { border: 0; padding: 0; margin: 0; }
+  .gains { display: flex; gap: 14px; margin-bottom: 14px; }
+  label { flex: 1; min-width: 0; }
+  input { display: block; width: 100%; margin-top: 6px; }
+  #notice { min-height: 24px; color: #a1262e; }
+  @media (max-width: 400px) { dd { font-size: 18px; } section { padding: 16px; } }
+</style>
+<h1>Balancing robot</h1>
+<p class="muted">Local Wi-Fi control · ESP32-C6</p>
+<div class="row">
+  <strong id="connection" role="status">Disconnected</strong>
+  <button id="connect">Connect</button>
+</div>
+<section>
+  <dl class="metrics">
+    <div><dt>Tilt (rad)</dt><dd id="tilt">—</dd></div>
+    <div><dt>Rate (rad/s)</dt><dd id="rate">—</dd></div>
+    <div><dt>PD command u</dt><dd id="command">—</dd></div>
+  </dl>
+  <p>Mode: <strong id="mode">—</strong></p>
+  <p id="status" class="muted">Connect to read the robot's state.</p>
+</section>
+<section>
+  <h2>Motors</h2>
+  <div class="row">
+    <button data-command="test left" disabled>Test left</button>
+    <button data-command="test right" disabled>Test right</button>
+    <button class="primary" data-command="balance" disabled>Start balancing</button>
+  </div>
+  <button id="stop" disabled>STOP</button>
+  <p class="muted">Each test runs one motor at 100% PWM for 300 ms. Lift the wheels before testing. Balancing starts with zero gains.</p>
+</section>
+<section>
+  <h2>PD gains</h2>
+  <form id="gains-form">
+    <fieldset id="gains-fields" disabled>
+      <div class="gains">
+        <label>Kp<input id="kp" type="number" min="0" step="any" value="0" required></label>
+        <label>Kd<input id="kd" type="number" min="0" step="any" value="0" required></label>
+      </div>
+      <button type="submit">Apply gains</button>
+    </fieldset>
+  </form>
+  <p class="muted">Applied: <span id="applied">—</span>. Stop before changing gains. Values reset to zero when the robot reboots.</p>
+</section>
+<p id="notice" role="alert"></p>
+<p class="muted">Closing or hiding this page stops wireless control. If heartbeats stop arriving, the robot stops within about one second.</p>
+<script>
+  const byId = id => document.getElementById(id);
+  const commandButtons = document.querySelectorAll('[data-command]');
+  let socket = null;
+  let heartbeat = null;
+  let lastReply = 0;
+  let gainsEdited = false;
+
+  function disableControls() {
+    commandButtons.forEach(button => button.disabled = true);
+    byId('gains-fields').disabled = true;
+    byId('stop').disabled = true;
+    for (const id of ['tilt', 'rate', 'command', 'mode', 'applied']) byId(id).textContent = '—';
+  }
+
+  function disconnect(message) {
+    clearInterval(heartbeat);
+    const previous = socket;
+    socket = null;
+    if (previous) previous.close();
+    disableControls();
+    byId('connection').textContent = 'Disconnected';
+    byId('connect').textContent = 'Connect';
+    byId('status').textContent = message;
+  }
+
+  function send(command) {
+    if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+    socket.send(command);
+    return true;
+  }
+
+  function connect() {
+    byId('notice').textContent = '';
+    byId('connection').textContent = 'Connecting…';
+    byId('connect').textContent = 'Disconnect';
+    const current = new WebSocket(`ws://${location.host}/ws`);
+    socket = current;
+    current.onopen = () => {
+      if (socket !== current) return;
+      lastReply = Date.now();
+      byId('stop').disabled = false;
+      send('heartbeat');
+      heartbeat = setInterval(() => {
+        if (Date.now() - lastReply > 1500) {
+          disconnect('No reply from robot. Reconnect before continuing.');
+        } else {
+          send('heartbeat');
+        }
+      }, 250);
+    };
+    current.onmessage = event => {
+      if (socket !== current) return;
+      const data = JSON.parse(event.data);
+      if (data.error) { byId('notice').textContent = data.error; return; }
+      if (!('sample_valid' in data)) return;
+      lastReply = Date.now();
+      byId('connection').textContent = 'Connected';
+      byId('tilt').textContent = data.sample_valid ? data.tilt_rad.toFixed(3) : '—';
+      byId('rate').textContent = data.sample_valid ? data.rate_rad_s.toFixed(3) : '—';
+      byId('command').textContent = data.command.toFixed(3);
+      byId('mode').textContent = data.mode;
+      byId('status').textContent = data.status;
+      byId('applied').textContent = `Kp = ${data.kp}, Kd = ${data.kd}`;
+      if (!gainsEdited) {
+        byId('kp').value = data.kp;
+        byId('kd').value = data.kd;
+      }
+      const idle = data.mode === 'idle';
+      commandButtons.forEach(button => button.disabled = !idle || !data.motors_ready ||
+        (button.dataset.command === 'balance' && !data.sample_valid));
+      byId('gains-fields').disabled = !idle;
+    };
+    current.onclose = () => {
+      if (socket === current) disconnect('Connection closed. Reconnect before continuing.');
+    };
+    current.onerror = () => {
+      if (socket === current) disconnect('Cannot connect. Join the robot Wi-Fi and close other control pages.');
+    };
+  }
+
+  function stopAndDisconnect() {
+    send('stop');
+    disconnect('Control page disconnected.');
+  }
+
+  byId('connect').onclick = () => socket ? stopAndDisconnect() : connect();
+  byId('stop').onclick = () => { byId('notice').textContent = ''; send('stop'); };
+  commandButtons.forEach(button => button.onclick = () => {
+    byId('notice').textContent = '';
+    send(button.dataset.command);
+  });
+  for (const id of ['kp', 'kd']) byId(id).oninput = () => { gainsEdited = true; };
+  byId('gains-form').onsubmit = event => {
+    event.preventDefault();
+    const kp = Number(byId('kp').value);
+    const kd = Number(byId('kd').value);
+    if (![kp, kd].every(value => Number.isFinite(value) && value >= 0)) return;
+    byId('notice').textContent = '';
+    send(`gains ${kp} ${kd}`);
+  };
+  document.addEventListener('visibilitychange', () => { if (document.hidden) stopAndDisconnect(); });
+  window.addEventListener('pagehide', stopAndDisconnect);
+  connect();
+</script>
+</html>
